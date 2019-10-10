@@ -34,6 +34,16 @@ typedef struct PinnedPageQueue {
 
 #define PIN_PAGES_IN_BATCH (1UL << 63)
 
+// By default, wake up unpin thread every 20 seconds
+#define DEFAULT_UNPIN_INTERVAL 20
+
+typedef enum {
+    UNPIN_POLICY_OFF,
+    UNPIN_POLICY_LRU,
+} unpin_policy;
+
+#define PVDMA_UNPIN_THREAD_NAME_SIZE 20
+
 typedef struct pin_pages_info {
        unsigned short bdf;
        unsigned short pad[3];
@@ -50,6 +60,16 @@ typedef struct PvDmaMmioInfo {
           uint64_t gfn_bdf;
       } info;
 } PvDmaMmioInfo;
+
+typedef struct PvDmaUnpinInfo {
+    QemuThread unpin_thread;
+    QEMUTimer *unpin_timer;
+    int64_t unpin_timer_target;
+    QemuMutex thr_mutex;
+    QemuCond thr_cond;
+    uint64_t unpin_interval;
+    uint8_t  unpin_policy;
+} PvDmaUnpinInfo;
 
 #define IPTE_MAP_CNT_MASK	0xFFFF
 #define IPTE_MAP_CNT_MAX	0xFF
@@ -92,6 +112,7 @@ typedef struct PvDmaState {
     QemuMutex mutex;
     PvDmaIpt ipt;
     PinnedPageQueue pinned_pages;
+    PvDmaUnpinInfo unpin_info;
 } PvDmaState;
 
 bool has_pvdma = false;
@@ -426,6 +447,56 @@ static const MemoryRegionOps pvdma_mmio_ops = {
     },
 };
 
+static void pvdma_shrink_pinned_pages(PvDmaState* s)
+{
+    warn_report("%s(): start unpin.\n", __FUNCTION__);
+}
+
+static void pvdma_unpin_timer(void *opaque)
+{
+    PvDmaState *s = opaque;
+    PvDmaUnpinInfo *info = &s->unpin_info;
+
+    info->unpin_timer_target += info->unpin_interval * 1000;
+
+    timer_mod(info->unpin_timer, info->unpin_timer_target);
+
+    qemu_cond_signal(&info->thr_cond);
+}
+
+static void *pvdma_unpin_thread_fn(void *arg)
+{
+    PvDmaState *s = arg;
+    PvDmaUnpinInfo *unpin_info = &s->unpin_info;
+
+    while (1) {
+        qemu_cond_wait(&unpin_info->thr_cond, &unpin_info->thr_mutex);
+
+        pvdma_shrink_pinned_pages(s);
+
+        qemu_mutex_unlock(&unpin_info->thr_mutex);
+    }
+
+    return NULL;
+}
+
+static void pvdma_start_unpin_thread(PvDmaState *s)
+{
+    char thread_name[PVDMA_UNPIN_THREAD_NAME_SIZE];
+    PvDmaUnpinInfo *info = &s->unpin_info;
+
+    sprintf(thread_name, "%s", "PVDMA unpin thread");
+    qemu_thread_create(&info->unpin_thread, thread_name, pvdma_unpin_thread_fn,
+                       s, QEMU_THREAD_JOINABLE);
+
+    qemu_mutex_init(&info->thr_mutex);
+    qemu_cond_init(&info->thr_cond);
+
+    info->unpin_timer = timer_new_ms(QEMU_CLOCK_HOST, pvdma_unpin_timer, s);
+    info->unpin_timer_target = qemu_clock_get_ms(QEMU_CLOCK_HOST) +
+                               info->unpin_interval * 1000;
+    timer_mod(info->unpin_timer, info->unpin_timer_target);
+}
 
 static void pvdma_pci_realize(PCIDevice *pdev, Error **errp)
 {
@@ -455,11 +526,22 @@ static void pvdma_pci_realize(PCIDevice *pdev, Error **errp)
     QTAILQ_INIT(&pvdma->pinned_pages.page_list);
 
     qemu_mutex_init(&pvdma->pinned_pages.page_list_lock);
+
+    if (pvdma->unpin_info.unpin_policy != UNPIN_POLICY_OFF)
+        pvdma_start_unpin_thread(pvdma);
 }
 
 static void pvdma_reset(DeviceState *dev)
 {
 }
+
+static Property pvdma_properties[] = {
+    DEFINE_PROP_UINT8("unpin-policy", PvDmaState,
+                      unpin_info.unpin_policy, UNPIN_POLICY_OFF),
+    DEFINE_PROP_UINT64("unpin-interval", PvDmaState,
+                      unpin_info.unpin_interval, DEFAULT_UNPIN_INTERVAL),
+    DEFINE_PROP_END_OF_LIST(),
+};
 
 static void pvdma_class_init(ObjectClass *class, void *data)
 {
@@ -471,6 +553,7 @@ static void pvdma_class_init(ObjectClass *class, void *data)
     k->device_id = PVDMA_PCI_DEVICE_ID;
     k->revision = 0x10;
     k->class_id = PCI_CLASS_OTHERS;
+    dc->props = pvdma_properties;
     dc->reset = pvdma_reset;
     set_bit(DEVICE_CATEGORY_MISC, dc->categories);
 }

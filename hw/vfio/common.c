@@ -246,6 +246,8 @@ static int vfio_dma_unmap(VFIOContainer *container,
     return 0;
 }
 
+extern bool has_pvdma;
+
 static int vfio_dma_map(VFIOContainer *container, hwaddr iova,
                         ram_addr_t size, void *vaddr, bool readonly)
 {
@@ -256,6 +258,9 @@ static int vfio_dma_map(VFIOContainer *container, hwaddr iova,
         .iova = iova,
         .size = size,
     };
+
+    if (true == has_pvdma)
+        return 0;
 
     if (!readonly) {
         map.flags |= VFIO_DMA_MAP_FLAG_WRITE;

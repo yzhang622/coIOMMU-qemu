@@ -1658,6 +1658,16 @@ void pci_for_each_device(PCIBus *bus, int bus_num,
     }
 }
 
+void pci_for_all_buses(void (*fn)(PCIBus *b, void *opaque),
+                              void* opaque)
+{
+    PCIHostState *host_bridge;
+
+    QLIST_FOREACH(host_bridge, &pci_host_bridges, next) {
+        pci_for_each_bus(host_bridge->bus, fn, opaque);
+    }
+}
+
 static const pci_class_desc *get_class_desc(int class)
 {
     const pci_class_desc *desc;

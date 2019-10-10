@@ -3083,6 +3083,8 @@ static void vfio_realize(PCIDevice *pdev, Error **errp)
     vfio_register_req_notifier(vdev);
     vfio_setup_resetfn_quirk(vdev);
 
+    pdev->vfio_container_fd = group->container->fd;
+
     return;
 
 out_teardown:

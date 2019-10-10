@@ -283,6 +283,9 @@ struct PCIDevice {
 
     /* the following fields are read only */
     int32_t devfn;
+
+    int vfio_container_fd;
+
     /* Cached device to fetch requester ID from, to avoid the PCI
      * tree walking every time we invoke PCI request (e.g.,
      * MSI). For conventional PCI root complex, this field is
@@ -456,6 +459,9 @@ void pci_for_each_bus_depth_first(PCIBus *bus,
                                   void *(*begin)(PCIBus *bus, void *parent_state),
                                   void (*end)(PCIBus *bus, void *state),
                                   void *parent_state);
+void pci_for_all_buses(void (*fn)(PCIBus *b, void *opaque),
+                              void* opaque);
+
 PCIDevice *pci_get_function_0(PCIDevice *pci_dev);
 
 /* Use this wrapper when specific scan order is not required. */

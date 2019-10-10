@@ -17,13 +17,21 @@
 
 #define TYPE_PCI_PVDMA_DEVICE "pvdma-pci"
 #define PVDMA(obj)        OBJECT_CHECK(PvDmaState, obj, TYPE_PCI_PVDMA_DEVICE)
+
+typedef struct PinnedPage {
+    QTAILQ_ENTRY(PinnedPage) entry;
+    unsigned long gfn;
+}PinnedPage;
+
 typedef struct PinnedPageQueue {
     unsigned long count;
     QemuMutex page_list_lock;
     QTAILQ_HEAD(, PinnedPage) page_list;
 } PinnedPageQueue;
+
 #define PAGE_SHIFT_4K          12
 #define PAGE_SIZE_4K           (1 << PAGE_SHIFT_4K)
+
 #define PIN_PAGES_IN_BATCH (1UL << 63)
 
 typedef struct pin_pages_info {
@@ -83,6 +91,7 @@ typedef struct PvDmaState {
     MemoryRegion device_info_region;
     QemuMutex mutex;
     PvDmaIpt ipt;
+    PinnedPageQueue pinned_pages;
 } PvDmaState;
 
 bool has_pvdma = false;
@@ -209,6 +218,38 @@ static PCIDevice* pvdma_get_device(uint16_t bdf, bool *is_assigned)
 
     return pdev;
 }
+static inline void pinned_page_list_add(PvDmaState *s, unsigned long gfn, PCIDevice* pdev)
+{
+    PinnedPage *page;
+
+    page = g_malloc0(sizeof(PinnedPage));
+
+    if (!page)
+        return;
+
+    qemu_mutex_lock(&s->pinned_pages.page_list_lock);
+
+    page->gfn = gfn;
+
+    QTAILQ_INSERT_HEAD(&s->pinned_pages.page_list, page, entry);
+    s->pinned_pages.count++;
+
+    qemu_mutex_unlock(&s->pinned_pages.page_list_lock);
+}
+
+static inline void pinned_page_list_remove(PvDmaState *s, PinnedPage *page)
+{
+    // Note: removed below lock, and require the caller to do so.
+    //qemu_mutex_lock(&s->pinned_pages.page_list_lock);
+
+    QTAILQ_REMOVE(&s->pinned_pages.page_list, page, entry);
+    s->pinned_pages.count--;
+
+    //qemu_mutex_unlock(&s->pinned_pages.page_list_lock);
+
+    g_free(page);
+}
+
 static int pvdma_pin_page(PvDmaState *pvdma, uint64_t gfn, PCIDevice *pdev)
 {
     uint64_t vaddr;
@@ -264,6 +305,9 @@ static int pvdma_pin_page(PvDmaState *pvdma, uint64_t gfn, PCIDevice *pdev)
     }
 
     qemu_mutex_unlock(&pvdma->mutex);
+
+    if (ret == 0)
+        pinned_page_list_add(pvdma, gfn, pdev);
 
     return ret;
 }
@@ -407,6 +451,10 @@ static void pvdma_pci_realize(PCIDevice *pdev, Error **errp)
     pci_register_bar(pdev, 2, type, &pvdma->device_info_region);
 
     qemu_mutex_init(&pvdma->mutex);
+
+    QTAILQ_INIT(&pvdma->pinned_pages.page_list);
+
+    qemu_mutex_init(&pvdma->pinned_pages.page_list_lock);
 }
 
 static void pvdma_reset(DeviceState *dev)

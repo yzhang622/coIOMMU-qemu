@@ -24,6 +24,14 @@ typedef struct PinnedPageQueue {
 } PinnedPageQueue;
 #define PAGE_SHIFT_4K          12
 #define PAGE_SIZE_4K           (1 << PAGE_SHIFT_4K)
+#define PIN_PAGES_IN_BATCH (1UL << 63)
+
+typedef struct pin_pages_info {
+       unsigned short bdf;
+       unsigned short pad[3];
+       unsigned long  nr_pages;
+       uint64_t       pfn[0];
+} pin_pages_info;
 
 typedef struct PvDmaMmioInfo {
     uint64_t regs[4];
@@ -260,6 +268,37 @@ static int pvdma_pin_page(PvDmaState *pvdma, uint64_t gfn, PCIDevice *pdev)
     return ret;
 }
 
+static void pvdma_pin_page_in_batch(PvDmaState *pvdma, uint64_t gfn_bdf)
+{
+    uint64_t vaddr;
+    bool read_only;
+    uint64_t gpa = (gfn_bdf & ~PIN_PAGES_IN_BATCH);
+    uint64_t count = 0;
+    uint16_t bdf;
+    pin_pages_info *pin_info;
+    bool is_assigned;
+    PCIDevice *pdev = NULL;
+
+    if (!pvdma_get_vaddr(gpa, (void **)&vaddr, &read_only)) {
+        error_report("get vaddr failed for gpa: 0x%lx.\n", gpa);
+        return;
+    }
+
+    pin_info = (pin_pages_info *)vaddr;
+    bdf = pin_info->bdf;
+    pdev = pvdma_get_device(bdf, &is_assigned);
+    if (!pdev || !is_assigned) {
+        set_bit_atomic(bdf, pvdma->device_bitmap);
+    } else {
+        while(count < pin_info->nr_pages) {
+            pvdma_pin_page(pvdma, pin_info->pfn[count], pdev);
+            count++;
+        }
+    }
+    return;
+}
+
+
 static uint64_t pvdma_mmio_read(void *opaque, hwaddr addr, uint32_t size)
 {
     PvDmaState *pvdma = opaque;
@@ -313,14 +352,17 @@ static void pvdma_mmio_write(void *opaque, hwaddr addr, uint64_t val,
         pvdma->ipt.ipt_level = val;
     } else if (addr == 0x18) {
         gfn_bdf = val;
-        bdf = gfn_bdf & 0xffff;
-        pdev = pvdma_get_device(bdf, &is_assigned);
-        if (!pdev || !is_assigned) {
-            set_bit_atomic(bdf, pvdma->device_bitmap);
+        if (!(gfn_bdf & PIN_PAGES_IN_BATCH)) {
+            bdf = gfn_bdf & 0xffff;
+            pdev = pvdma_get_device(bdf, &is_assigned);
+            if (!pdev || !is_assigned) {
+                set_bit_atomic(bdf, pvdma->device_bitmap);
+            } else {
+                pvdma_pin_page(pvdma, gfn_bdf >> 16, pdev);
+            }
         } else {
-            pvdma_pin_page(pvdma, gfn_bdf >> 16, pdev);
+            pvdma_pin_page_in_batch(pvdma, gfn_bdf);
         }
-
     }
 
     return;

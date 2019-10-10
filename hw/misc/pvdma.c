@@ -21,6 +21,7 @@
 typedef struct PinnedPage {
     QTAILQ_ENTRY(PinnedPage) entry;
     unsigned long gfn;
+    PCIDevice* pdev;
 }PinnedPage;
 
 typedef struct PinnedPageQueue {
@@ -239,6 +240,59 @@ static PCIDevice* pvdma_get_device(uint16_t bdf, bool *is_assigned)
 
     return pdev;
 }
+
+#define UNPIN_SUCCESSFUL   0
+#define UNPIN_ALREADY_DONE 1
+#define UNPIN_NO_NEED      2
+
+static inline int pvdma_unpin_page(uint64_t gfn, PCIDevice *pdev)
+{
+    uint64_t iova = (gfn << PAGE_SHIFT_4K);
+    struct vfio_iommu_type1_dma_unmap unmap = {
+        .argsz = sizeof(unmap),
+        .flags = 0,
+        .iova = iova,
+        .size = PAGE_SIZE_4K,
+    };
+    int ret;
+
+    ret = ioctl(pdev->vfio_container_fd, VFIO_IOMMU_UNMAP_DMA, &unmap);
+
+    return ret;
+}
+
+static int pvdma_try_unpin_page(PvDmaState *pvdma, uint64_t gfn, PCIDevice *pdev, IptLeafEntry *leaf_pte)
+{
+    int ret;
+
+    qemu_mutex_lock(&pvdma->mutex);
+
+    if (!pvdma_test_flag(IPTE_PINNED_FLAG, leaf_pte)) {
+        qemu_mutex_unlock(&pvdma->mutex);
+        return UNPIN_ALREADY_DONE;
+    }
+
+    if (!(atomic_read(&leaf_pte->ipte) & IPTE_MAP_CNT_MASK)) {
+        pvdma_clear_flag(IPTE_PINNED_FLAG, leaf_pte);
+    }
+
+    if (atomic_read(&leaf_pte->ipte) & IPTE_MAP_CNT_MASK) {
+        pvdma_set_flag(IPTE_PINNED_FLAG, leaf_pte);
+        qemu_mutex_unlock(&pvdma->mutex);
+        return UNPIN_NO_NEED;
+    }
+
+    ret = pvdma_unpin_page(gfn, pdev);
+
+    if (ret != UNPIN_SUCCESSFUL) {
+        pvdma_set_flag(IPTE_PINNED_FLAG, leaf_pte);
+        error_report("VFIO_UNMAP_DMA failed, ret=%d, errno=%d.\n", ret, errno);
+    }
+
+    qemu_mutex_unlock(&pvdma->mutex);
+    return ret;
+}
+
 static inline void pinned_page_list_add(PvDmaState *s, unsigned long gfn, PCIDevice* pdev)
 {
     PinnedPage *page;
@@ -251,6 +305,7 @@ static inline void pinned_page_list_add(PvDmaState *s, unsigned long gfn, PCIDev
     qemu_mutex_lock(&s->pinned_pages.page_list_lock);
 
     page->gfn = gfn;
+    page->pdev = pdev;
 
     QTAILQ_INSERT_HEAD(&s->pinned_pages.page_list, page, entry);
     s->pinned_pages.count++;
@@ -449,7 +504,35 @@ static const MemoryRegionOps pvdma_mmio_ops = {
 
 static void pvdma_shrink_pinned_pages(PvDmaState* s)
 {
-    warn_report("%s(): start unpin.\n", __FUNCTION__);
+    PinnedPage *page = NULL;
+    PinnedPage *prev_page = NULL;
+    int ret;
+    IptLeafEntry *leaf_pte = NULL;
+
+    if (unlikely(s->unpin_info.unpin_policy == UNPIN_POLICY_OFF))
+        return;
+
+    qemu_mutex_lock(&s->pinned_pages.page_list_lock);
+
+    QTAILQ_FOREACH_REVERSE_SAFE(page,
+                                &s->pinned_pages.page_list,
+                                entry, prev_page) {
+        leaf_pte = pfn_to_ipt_pte(s, page->gfn);
+        if (leaf_pte != NULL &&
+            pvdma_test_flag(IPTE_PINNED_FLAG, leaf_pte) &&
+            !pvdma_test_flag(IPTE_ACCESSED_FLAG, leaf_pte) &&
+            !(atomic_read(&leaf_pte->ipte) & IPTE_MAP_CNT_MASK)) {
+            ret = pvdma_try_unpin_page(s, page->gfn, page->pdev, leaf_pte);
+            if (ret != UNPIN_NO_NEED) {
+                pinned_page_list_remove(s, page);
+            }
+        }
+        pvdma_clear_flag(IPTE_ACCESSED_FLAG, leaf_pte);
+    }
+
+    // memset(s->accessed_bitmap, 0, PVDMA_BITMAP_SIZE_BYTE);
+
+    qemu_mutex_unlock(&s->pinned_pages.page_list_lock);
 }
 
 static void pvdma_unpin_timer(void *opaque)
@@ -533,6 +616,27 @@ static void pvdma_pci_realize(PCIDevice *pdev, Error **errp)
 
 static void pvdma_reset(DeviceState *dev)
 {
+    PvDmaState *pvdma = PVDMA(dev);
+    PinnedPage *page = NULL;
+    PinnedPage *prev_page = NULL;
+    int ret;
+
+    qemu_mutex_lock(&pvdma->pinned_pages.page_list_lock);
+
+    qemu_mutex_lock(&pvdma->mutex);
+
+    QTAILQ_FOREACH_REVERSE_SAFE(page,
+                                &pvdma->pinned_pages.page_list,
+                                entry, prev_page) {
+        ret = pvdma_unpin_page(page->gfn, page->pdev);
+        if (ret != UNPIN_NO_NEED) {
+            pinned_page_list_remove(pvdma, page);
+        }
+    }
+
+    qemu_mutex_unlock(&pvdma->mutex);
+
+    qemu_mutex_unlock(&pvdma->pinned_pages.page_list_lock);
 }
 
 static Property pvdma_properties[] = {
